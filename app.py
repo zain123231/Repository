@@ -44,15 +44,30 @@ def load_ocr_reader():
     return easyocr.Reader(['ar', 'en'], gpu=torch.cuda.is_available())
 
 def get_predictions(image, use_iraq=False, top_k=3):
-    device, model, transform, global_index, global_cities, iraq_index, iraq_cities = load_models_and_index()
+    device, model, _, global_index, global_cities, iraq_index, iraq_cities = load_models_and_index()
     
-    img_tensor = transform(image).unsqueeze(0).to(device)
+    import torch.nn.functional as F
+    import torch
+    import numpy as np
+    
+    # 1. TTA (Test-Time Augmentation): 10 Crops
+    base_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.TenCrop(224)
+    ])
+    to_tensor_norm = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    
+    crops = base_transform(image)
+    img_tensor = torch.stack([to_tensor_norm(crop) for crop in crops]).to(device)
     
     with torch.no_grad():
-        img_features = model.image_encoder(img_tensor)
-        import torch.nn.functional as F
-        img_features = F.normalize(img_features, dim=1)
-        img_features = img_features.cpu().numpy()
+        img_features_batch = model.image_encoder(img_tensor)
+        img_feature = img_features_batch.mean(dim=0, keepdim=True)
+        img_feature = F.normalize(img_feature, dim=-1)
+        img_features_np = img_feature.cpu().numpy()
         
     if use_iraq and iraq_index is not None:
         index = iraq_index
@@ -65,33 +80,60 @@ def get_predictions(image, use_iraq=False, top_k=3):
             index.nprobe = min(64, getattr(index, 'nlist', 64))
         cities = global_cities
         
-    distances, indices = index.search(img_features, top_k)
+    # Coarse Search
+    distances, indices = index.search(img_features_np, top_k)
     
-    results = []
+    coarse_candidates = []
     for i in range(top_k):
         idx = indices[0][i]
         dist = distances[0][i]
         row = cities.iloc[idx]
-        
-        # Calculate confidence from Cosine Similarity (Inner Product)
-        # Inner product is usually in [-1, 1], so we map it to 0-100%
-        conf = max(0, dist * 100)
-        
-        # Format name properly whether it's a City or Grid Point
         name = row.get('City', 'Unknown')
-        if pd.isna(name):
-            name = "Grid Location"
-            
-        results.append({
-            "name": name,
-            "country": row.get('CountryCode', 'Unknown'),
-            "lat": row['LAT'],
-            "lon": row['LON'],
-            "distance": dist,
-            "confidence": f"{conf:.1f}%"
-        })
+        if pd.isna(name): name = "Grid Location"
+        country = row.get('CountryCode', 'Unknown')
+        lat = row['LAT']
+        lon = row['LON']
+        coarse_candidates.append((lat, lon, name, country, dist))
+
+    # Coarse-to-Fine Micro-Grid
+    results = []
+    grid_steps = 40
+    offset_range = 0.5
+    offsets = np.linspace(-offset_range, offset_range, grid_steps)
+
+    for rank, (coarse_lat, coarse_lon, name, country, dist) in enumerate(coarse_candidates):
+        lat_grid, lon_grid = np.meshgrid(coarse_lat + offsets, coarse_lon + offsets)
+        micro_grid = np.vstack([lat_grid.ravel(), lon_grid.ravel()]).T
+        micro_grid_tensor = torch.tensor(micro_grid, dtype=torch.float32).to(device)
         
-    return results
+        with torch.no_grad():
+            loc_features = model.location_encoder(micro_grid_tensor)
+            loc_features = F.normalize(loc_features, dim=-1)
+            
+            logit_scale = model.logit_scale.exp()
+            similarity = logit_scale * (img_feature @ loc_features.T)
+            
+            best_local_idx = similarity.argmax().item()
+            best_local_score = similarity[0, best_local_idx].item()
+            best_local_coord = micro_grid[best_local_idx]
+            
+            # Map score roughly to confidence
+            raw_cosine = best_local_score / logit_scale.item()
+            conf = max(0.0, raw_cosine * 100.0)
+            
+            results.append({
+                "name": name,
+                "country": country,
+                "lat": best_local_coord[0],
+                "lon": best_local_coord[1],
+                "distance": best_local_score,
+                "confidence": f"{conf:.1f}%"
+            })
+            
+    # Sort results by the new refined score (highest first)
+    results.sort(key=lambda x: x['distance'], reverse=True)
+    
+    return results[:top_k]
 
 def get_exif_location(image):
     try:
@@ -147,7 +189,7 @@ def main():
     
     if uploaded_file is not None:
         image = Image.open(uploaded_file).convert("RGB")
-        st.image(image, caption="Uploaded Image", use_column_width=True)
+        st.image(image, caption="Uploaded Image", use_container_width=True)
         
         if st.button("📍 Predict Location", type="primary"):
             # Check for EXIF data first
