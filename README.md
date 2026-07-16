@@ -69,3 +69,9 @@ python src/predict.py "path/to/image.jpg" --iraq
 - **Hybrid System (Coarse Classification):** Replaced exhaustive L2 distance search with `IndexIVFFlat`. By training the quantizer on a 200,000-sample subset and distributing 5.1M embeddings incrementally, we resolved previous memory leak constraints.
 - **Data Fusion:** Combined baseline visual embeddings with EXIF metadata and multi-language OCR to create a robust, multi-modal prediction pipeline.
 - **Domain Adaptation:** Overcame geographic bias in the baseline GeoCLIP model by enforcing region-specific FAISS index bounds, forcing the network to match desert/local architecture exclusively with regional datasets.
+
+---
+
+## 📚 Academic & Engineering Guide
+For an in-depth explanation of the models, the `std::bad_alloc` memory leak solution, how we resolved the geographic bias, and more key code snippets, please refer to the extended academic guide:
+👉 **[Read the Academic & Engineering Guide](presentation_guide_extended.md)**
